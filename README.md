@@ -19,3 +19,9 @@ urubasic is supplied in source and can easily be ported to other systems. Direct
 - Linux 64-bit and 32-bit
 - Windows Win32 (Visual Studio dsw file supplied)
 - ESP8266 nonos-sdk
+
+## Tests
+
+The test files in the test/ directory are meant to regression test the interpreter. if you want to run the tests then you can do that only under linux. The procedure is as follows: 
+1) Run once *chmod +x runtests.sh *
+2) Execute the tests with *make test*
