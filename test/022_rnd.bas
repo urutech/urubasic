@@ -1,0 +1,11 @@
+5 REM RANDOMIZE has no parameters
+6 REM we use it only to check if optional () work
+10 RANDOMIZE(9,8)
+20 RANDOMIZE 9, 8
+30 X = RND(100)
+40 IF X<100 THEN 100
+50 PRINT "FAILED"
+60 GOTO 999
+100 PRINT "SUCCESS"
+999 END
+

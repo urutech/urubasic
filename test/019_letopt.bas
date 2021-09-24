@@ -1,0 +1,5 @@
+10 LET X=6
+20 Y=8
+30 PRINT X*Y
+40 END
+
