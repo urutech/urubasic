@@ -64,6 +64,7 @@ enum ErrorCode {
     E_INVALID_OPTION_BASE = 12,
     E_INVALID_DIM         = 13,
     E_WRONG_TYPE          = 14,
+    E_INDEX_OUT_OF_BOUNDS = 15,
 };
 
 struct symbol_def {
@@ -235,6 +236,7 @@ static void ICACHE_FLASH_ATTR parse_error(int error)
         case E_INVALID_OPTION_BASE:error_msg("ERROR:%d: invalid OPTION BASE (%d)\n", current_line, error); break;
         case E_INVALID_DIM:        error_msg("ERROR:%d: invalid dimension specified (%d)\n", current_line, error); break;
         case E_WRONG_TYPE:         error_msg("ERROR:%d: wrong type in assignment (%d)\n", current_line, error); break;
+        case E_INDEX_OUT_OF_BOUNDS:error_msg("ERROR:%d: array index is out of bounds (%d)\n", current_line, error); break;
         default:                   error_msg("ERROR:%d: syntax error (%d)\n", current_line, error); break;
     }
 }
@@ -494,7 +496,8 @@ static int ICACHE_FLASH_ATTR parse_precedence(int tok, int *assoc)
     else if (tok == NOT || tok == (UNARY | NOT)) { *assoc = 1; /* right to left */ return 2; }
     else if (tok == RPAREN) return 999;
     else if (is_relop(tok)) return 20;
-    else if (is_logop(tok)) return 30;
+    else if (tok == AND) return 30;
+    else if (tok == OR) return 31;
     else return 1000;
 }
 
@@ -531,16 +534,16 @@ static void ICACHE_FLASH_ATTR reduce(int *arg_stack, int *operator_stack)
             case SOLIDUS:         stack_push(arg_stack, v1/v2); break;
             case (UNARY | MINUS): stack_push(arg_stack, -v1); break;
             case (UNARY | PLUS):  stack_push(arg_stack, v1); break;
-            case GT:              stack_push(arg_stack, v1>v2); break;
-            case LT:              stack_push(arg_stack, v1<v2); break;
-            case LE:              stack_push(arg_stack, v1<=v2); break;
-            case GE:              stack_push(arg_stack, v1>=v2); break;
-            case EQ:              stack_push(arg_stack, v1==v2); break;
-            case NEQ:             stack_push(arg_stack, v1!=v2); break;
-            case AND:             stack_push(arg_stack, v1&&v2); break;
+            case GT:              stack_push(arg_stack, v1>v2 ? -1 : 0); break;
+            case LT:              stack_push(arg_stack, v1<v2 ? -1 : 0); break;
+            case LE:              stack_push(arg_stack, v1<=v2 ? -1 : 0); break;
+            case GE:              stack_push(arg_stack, v1>=v2 ? -1 : 0); break;
+            case EQ:              stack_push(arg_stack, v1==v2 ? -1 : 0); break;
+            case NEQ:             stack_push(arg_stack, v1!=v2 ? -1 : 0); break;
+            case AND:             stack_push(arg_stack, v1&v2); break;
             case NOT:
-            case (UNARY|NOT):     stack_push(arg_stack, !v1); break;
-            case OR:              stack_push(arg_stack, v1||v2); break;
+            case (UNARY|NOT):     stack_push(arg_stack, ~v1); break;
+            case OR:              stack_push(arg_stack, v1|v2); break;
             default: stack_push(arg_stack, 0); break;
         }
         stack_push(arg_stack, NUMBER);
@@ -709,6 +712,11 @@ static int * ICACHE_FLASH_ATTR parse_subscript(int symidx)
         lex_push_token(tok);
 
     if (symbol[symidx].value_ptr == NULL) {
+        if ((y - option_base) + (x - option_base) >= size) {
+            parse_error(E_INDEX_OUT_OF_BOUNDS);
+            return NULL;
+        }
+
         symbol[symidx].value_ptr = smemblk_zalloc(symbol_names, (int16_t) (size * sizeof(int)));
         symbol[symidx].array_base_size = array_base_size;
     }
@@ -1396,33 +1404,42 @@ static int ICACHE_FLASH_ATTR stmt_option(int insn, struct urubasic_type *arg, vo
 
 static int ICACHE_FLASH_ATTR stmt_dim(int insn, struct urubasic_type *arg, void *user)
 {
-    int tok, x = 0, y = 0, symidx, size, dummy;
+    int tok, x, y, symidx, size, dummy, y_set;
     struct urubasic_type tval = { 0, };
 
-    tok = lex_next_token(&symidx);
-    check_token(tok, IDENTIFIER, E_MISSING_IDENTIFIER);
-    if (symidx == 0)
-        symidx = parse_lookup_symbol(token_text, 1);
+    do {
+        x = 0;
+        y = option_base;
+        y_set = 0;
+        tok = lex_next_token(&symidx);
+        check_token(tok, IDENTIFIER, E_MISSING_IDENTIFIER);
+        if (symidx == 0)
+            symidx = parse_lookup_symbol(token_text, 1);
 
-    tok = lex_next_token(&dummy);
-    if (LPAREN == check_token(tok, LPAREN, 0)) {
-        expr(&tval);
-        x = tval.value;
         tok = lex_next_token(&dummy);
-        if (COMMA == check_token(tok, COMMA, 0)) {
+        if (LPAREN == check_token(tok, LPAREN, 0)) {
             expr(&tval);
-            y = tval.value;
+            x = tval.value;
             tok = lex_next_token(&dummy);
+            if (COMMA == check_token(tok, COMMA, 0)) {
+                expr(&tval);
+                y = tval.value;
+                y_set = 1;
+                tok = lex_next_token(&dummy);
+            }
+            check_token(tok, RPAREN, E_MISSING_RPAREN);
         }
-        check_token(tok, RPAREN, E_MISSING_RPAREN);
-    }
 
-    if (x < option_base || y < option_base)
-        parse_error(E_INVALID_DIM);
+        if (x < option_base || (y_set && y < option_base))
+            parse_error(E_INVALID_DIM);
 
-    symbol[symidx].array_base_size = x - option_base + 1;
-    size = symbol[symidx].array_base_size * (y - option_base + 1) * sizeof(int);
-    symbol[symidx].value_ptr = smemblk_realloc(symbol_names, symbol[symidx].value_ptr, (int16_t) size);
+        symbol[symidx].array_base_size = x - option_base + 1;
+        size = symbol[symidx].array_base_size * (y - option_base + 1) * sizeof(int);
+        symbol[symidx].value_ptr = smemblk_realloc(symbol_names, symbol[symidx].value_ptr, (int16_t) size);
+        tok = lex_next_token(&dummy);
+    } while (COMMA == check_token(tok, COMMA, 0));
+
+    lex_push_token(tok);
     return insn+1;
 }
 
@@ -1585,7 +1602,7 @@ again:  do {
         } while (current_char == '\r' || current_char == '\n' || is_blank(current_char));
 
         if (current_char == '#') {
-            while (current_char != '\r' && current_char != '\n' && !is_blank(current_char))
+            while (current_char != '\r' && current_char != '\n')
                 current_char = lex_readchar(read_arg);
             goto again;
         }

@@ -1,0 +1,13 @@
+ 10 A(0) = 0
+ 20 A(1) = 0
+ 30 A(2) = 0
+100 X = A(0) OR A(1) AND A(2)
+140 PRINT A(0); A(1); A(2), X
+150 IF A(0) = 1 AND A(1) = 1 AND A(2) = 1 THEN 999
+160 FOR I=2 TO 0 STEP -1
+170   A(I) = A(I) + 1
+180   IF A(I) = 1 THEN 100
+190   A(I) = 0
+200 NEXT I
+210 GOTO 100
+999 END
