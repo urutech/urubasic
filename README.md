@@ -30,5 +30,5 @@ The test files in the test/ directory are meant to regression test the interpret
 
 ## Integration
 
-The supplied main.c is realizing a command line program to run BASIC programs. Usage: ./urubasic *filename*
+The supplied main.c is realizing a command line program to run BASIC programs. Usage: ./urubasic *filename*.
 Another way to use urubasic is by integrating it (and not run it standalone). You may add your own functions with the API defined in urubasic.h. In main.c you can see an example on how to integrate RND and RANDOMIZE functions.
