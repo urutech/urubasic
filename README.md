@@ -10,7 +10,7 @@ Why not? It is an easy to learn language that is very well suited for simple tas
 
 Based on the ECMA-55 specification from 1978, a few extensions are implemented such as:
 - No support of floating points. All numeric constants and variables are 32-bit integers
-- Variable names can be up 128 chars (not just single letters) long and can include the $ sign
+- Variable names can be up 128 chars long (not just single letters) and can include the $ sign
 - logical operators AND, OR and NOT are supported
 - line numbers are optional and only need to be used for GOTO and GOSUB
 - instructions may be seperated by colon (:)
@@ -30,5 +30,5 @@ The test files in the test/ directory are meant to regression test the interpret
 
 ## Integration
 
-The supplied main.c is realizing a command line program to run BASIC programs. Usage: ./urubasic <filename>
+The supplied main.c is realizing a command line program to run BASIC programs. Usage: ./urubasic *filename*
 Another way to use urubasic is by integrating it (and not run it standalone). You may add your own functions with the API defined in urubasic.h. In main.c you can see an example on how to integrate RND and RANDOMIZE functions.
