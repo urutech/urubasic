@@ -13,6 +13,8 @@
 #include <unistd.h>
 #endif
 
+static int global_mem[1024 * 8];
+
 static int read_from_fileno(void *arg)
 {
     // read one character from file
@@ -56,7 +58,7 @@ int main(int argc, char *argv[])
     if (argc > 1)
         fileno = open(argv[1], 0);
 
-    urubasic_init(4096 /* max_mem */, 128 /* max_symbols */, read_from_fileno, (void *) (long) fileno);
+    urubasic_init(global_mem, sizeof(global_mem), read_from_fileno, (void *) (long) fileno);
     urubasic_add_function("RND", fct_rnd, NULL);
     urubasic_add_function("RANDOMIZE", fct_randomize, NULL);
     urubasic_execute(0);

@@ -10,7 +10,7 @@ struct urubasic_type {
     int     value; // the value itself or a string offset
 };
 
-int ICACHE_FLASH_ATTR urubasic_init(int max_mem, int max_symbols, int (*read_from_stdin)(void *), void *arg);
+int ICACHE_FLASH_ATTR urubasic_init(void *mem, int max_mem, int (*read_from_stdin)(void *), void *arg);
 
 void ICACHE_FLASH_ATTR urubasic_add_function(char *name, int (*func)(int n, struct urubasic_type *arg, void *user), void *user);
 

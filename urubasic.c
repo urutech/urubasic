@@ -45,8 +45,9 @@ enum Token {
     NUMBER = MAX_SYMBOLS, NEWLINE, STRING, IDENTIFIER, LT, LE, GE, GT, LSH, RSH, NEQ, EQ, COMMA, SEMICOLON, LPAREN, RPAREN, CIRCUMFLEX,
     PLUS, MINUS, MULT, SOLIDUS, FUNCTION, AND, OR, NOT, COLON,
 
-    ALLOC = 0x4000, // flag set when STRING was allocaated within expression
-    UNARY = 0x8000, // flag set when operator (+, -) is unary
+    NAME_ALLOC = 0x2000, // flag set when name was allocaated
+    ALLOC      = 0x4000, // flag set when STRING was allocaated within expression
+    UNARY      = 0x8000, // flag set when operator (+, -) is unary
 };
 
 enum ErrorCode {
@@ -67,19 +68,22 @@ enum ErrorCode {
     E_INDEX_OUT_OF_BOUNDS = 15,
 };
 
+struct symbol_def;
+typedef struct symbol_def *SYMIDX;
+
 struct symbol_def {
     char *name;
     int  (*func)(int n, struct urubasic_type *arg, void *user);
     int  *value_ptr;
-    uint8_t value_type;  // type of value (points to NUMBER or STRING)
-    uint8_t reserved;
+    int16_t value_type;  // type of value (points to NUMBER or STRING)
     int16_t tok;
     int16_t array_base_size;
-    int16_t next;
+    int16_t reserved;
+    SYMIDX  next;
 };
 
 struct Insn_info {
-    int16_t offset;
+    char    *line;
     int16_t label;
     int8_t  sep;
 };
@@ -89,24 +93,27 @@ static char token_text[MAX_LINE_LEN];
 static int  pushed_token_stack[1+MAX_LOOKAHEAD];
 
 struct Insn_info *insn_info;
-static int16_t  insn_count;
-
-static char *program;
-static int16_t  program_size;
+static int16_t  insn_count, insn_max;
 
 // symbols
 static smemblk_t *symbol_names;
-static int16_t  symbol_count, current_line, *hashtab, extra_count;
-static struct symbol_def *symbol;
+static int16_t  current_line;
+static SYMIDX *hashtab;
+static struct symbol_def *extra_table;
 
 static int  for_loop_stack[1+3*FOR_LOOP_DEPTH];
-static int8_t master_control, option_base;
+static int8_t option_base;
+static SYMIDX master_control;
 
 static int (* lex_readchar)(void*);
 static char *data_buffer;
 static int16_t data_buffer_index, data_buffer_max;
 static void *read_arg;
 
+static struct symbol_def *ICACHE_FLASH_ATTR get_symbol(SYMIDX symidx)
+{
+    return symidx;
+}
 
 static int ICACHE_FLASH_ATTR hash(const char *s)
 {
@@ -126,67 +133,80 @@ static char * ICACHE_FLASH_ATTR store_string(char *text)
     return id;
 }
 
-static int ICACHE_FLASH_ATTR parse_add_extra_symbol(char *name)
+static SYMIDX ICACHE_FLASH_ATTR new_symbol(char *name)
 {
-    ++extra_count;
-    symbol[MAX_SYMBOLS-extra_count].name            = name;
-    symbol[MAX_SYMBOLS-extra_count].tok             = IDENTIFIER;
-    symbol[MAX_SYMBOLS-extra_count].value_ptr       = NULL;
-    symbol[MAX_SYMBOLS-extra_count].value_type      = NUMBER;
-    symbol[MAX_SYMBOLS-extra_count].array_base_size = 0;
-    symbol[MAX_SYMBOLS-extra_count].next            = 0;
-    return MAX_SYMBOLS-extra_count;
+    SYMIDX symidx;
+
+    symidx = smemblk_zalloc(symbol_names, sizeof(*symidx));
+    symidx->name = name;
+    return symidx;
 }
 
-static int ICACHE_FLASH_ATTR parse_add_symbol(char *name)
+static SYMIDX ICACHE_FLASH_ATTR parse_add_extra_symbol(char *name)
+{
+    SYMIDX symidx = new_symbol(name);
+
+    symidx->tok             = IDENTIFIER;
+    symidx->value_ptr       = NULL;
+    symidx->value_type      = NUMBER;
+    symidx->array_base_size = 0;
+    symidx->next            = extra_table;
+    extra_table = symidx;
+    return symidx;
+}
+
+static SYMIDX ICACHE_FLASH_ATTR parse_add_symbol(char *name)
 {
     // add a new symbol to the symbol table
+    SYMIDX symidx;
     int hval = hash(name);
-    symbol[symbol_count].name            = name;
-    symbol[symbol_count].tok             = IDENTIFIER;
-    symbol[symbol_count].value_ptr       = NULL;
-    symbol[symbol_count].value_type      = NUMBER;
-    symbol[symbol_count].array_base_size = 0;
-    symbol[symbol_count].next = hashtab[hval];
-    hashtab[hval] = symbol_count;
-
+    symidx = new_symbol(name);
+    symidx->tok             = IDENTIFIER;
+    symidx->value_ptr       = NULL;
+    symidx->value_type      = NUMBER | NAME_ALLOC;
+    symidx->array_base_size = 0;
+    symidx->next = hashtab[hval];
+    hashtab[hval] = symidx;
     if (name[1] == '\0' && name[0] >= 'A' && name[0] <= '_')
-        hashtab[HASHSIZE+name[0]-'A'] = symbol_count;  // store symidx for quick access, if name is single uppercase letter
+        hashtab[HASHSIZE+name[0]-'A'] = hashtab[hval];  // store symidx for quick access, if name is single uppercase letter
 
-    return symbol_count++;
+    return hashtab[hval];
 }
 
 static void ICACHE_FLASH_ATTR add_symbol_intern(char *name, int tok, int (*func)(int n, struct urubasic_type *arg, void *user), void *user)
 {
-    int symidx;
+    SYMIDX symidx;
     symidx = parse_add_symbol(name);
-    symbol[symidx].tok             = tok;
-    symbol[symidx].func            = func;
-    symbol[symidx].value_ptr       = user;
-    symbol[symidx].value_type      = NUMBER;
-    symbol[symidx].array_base_size = 0;
+    get_symbol(symidx)->tok             = tok;
+    get_symbol(symidx)->func            = func;
+    get_symbol(symidx)->value_ptr       = user;
+    get_symbol(symidx)->value_type      = NUMBER;
+    get_symbol(symidx)->array_base_size = 0;
 }
 
 void ICACHE_FLASH_ATTR urubasic_add_function(char *name, int (*func)(int n, struct urubasic_type *arg, void *user), void *user)
 {
-    int symidx;
+    SYMIDX symidx;
     symidx = parse_add_symbol(store_string(name));
-    symbol[symidx].tok             = FUNCTION;
-    symbol[symidx].func            = func;
-    symbol[symidx].value_ptr       = user;
-    symbol[symidx].value_type      = NUMBER;
-    symbol[symidx].array_base_size = 0;
+    get_symbol(symidx)->tok             = FUNCTION;
+    get_symbol(symidx)->func            = func;
+    get_symbol(symidx)->value_ptr       = user;
+    get_symbol(symidx)->value_type      = NUMBER | NAME_ALLOC;
+    get_symbol(symidx)->array_base_size = 0;
 }
 
-static int ICACHE_FLASH_ATTR parse_lookup_symbol(char *name, int add_if_not_exist)
+static SYMIDX ICACHE_FLASH_ATTR parse_lookup_symbol(char *name, int add_if_not_exist)
 {
     // lookup in extra space
-    int symidx, hval, idx;
+    int hval, idx;
+    SYMIDX symidx;
 
-    if (extra_count) {
-        for (symidx=MAX_SYMBOLS-1; symidx>=MAX_SYMBOLS-extra_count; --symidx) {
-            if (0 == strcmp(symbol[symidx].name, name))
+    if (extra_table) {
+        symidx = extra_table;
+        while (symidx) {
+            if (0 == strcmp(get_symbol(symidx)->name, name))
                 return symidx;
+            symidx = symidx->next;
         }
     }
 
@@ -199,8 +219,8 @@ static int ICACHE_FLASH_ATTR parse_lookup_symbol(char *name, int add_if_not_exis
     }
 
     hval = hash(name);
-    for (symidx=hashtab[hval]; symidx != 0; symidx = symbol[symidx].next) {
-        if (symbol[symidx].name == name || 0 == strcmp(symbol[symidx].name, name))
+    for (symidx=hashtab[hval]; symidx != 0; symidx = get_symbol(symidx)->next) {
+        if (get_symbol(symidx)->name == name || 0 == strcmp(get_symbol(symidx)->name, name))
             return symidx;
     }
 
@@ -305,12 +325,14 @@ static void ICACHE_FLASH_ATTR lex_push_token(int tok)
     stack_push(pushed_token_stack, tok); // remember token for reading it again
 }
 
-static int ICACHE_FLASH_ATTR lex_next_token(int *symidx)
+static int ICACHE_FLASH_ATTR lex_next_token(SYMIDX *symidx)
 {
     // read one token from input stream
     *symidx = 0;
-    if (!stack_empty(pushed_token_stack))
-        return stack_pop(pushed_token_stack);  // use tok stored on stack
+    if (!stack_empty(pushed_token_stack)) {
+        int tok = stack_pop(pushed_token_stack);  // use tok stored on stack
+        return tok;
+    }
 
     do {
         if (previous_char != 0)
@@ -380,8 +402,8 @@ static int ICACHE_FLASH_ATTR lex_next_token(int *symidx)
             lex_shift();
             *symidx = parse_lookup_symbol(token_text, 0);
 
-            if (*symidx != 0 && *symidx < symbol_count)
-                return *symidx;
+            if (*symidx != NULL)
+                return get_symbol(*symidx)->tok;
             else
                 return IDENTIFIER;
         }
@@ -424,13 +446,13 @@ static int ICACHE_FLASH_ATTR lex_next_token(int *symidx)
     }
 }
 
-static int ICACHE_FLASH_ATTR assign(char *name, int value)
+static SYMIDX ICACHE_FLASH_ATTR assign(char *name, int value)
 {
     // assign a value to a variable
-    int symidx = parse_lookup_symbol(name, 1);
-    if (symbol[symidx].value_ptr == NULL)
-        symbol[symidx].value_ptr = smemblk_alloc(symbol_names, sizeof(int));
-    *symbol[symidx].value_ptr = value;
+    SYMIDX symidx = parse_lookup_symbol(name, 1);
+    if (get_symbol(symidx)->value_ptr == NULL)
+        get_symbol(symidx)->value_ptr = smemblk_alloc(symbol_names, sizeof(int));
+    *get_symbol(symidx)->value_ptr = value;
     return symidx;
 }
 
@@ -446,14 +468,14 @@ static int ICACHE_FLASH_ATTR find_insn(int label)
     return -1;
 }
 
-static int ICACHE_FLASH_ATTR check_token(int tok, int expect, int error)
+static int ICACHE_FLASH_ATTR check_token(int tok, SYMIDX symidx, int expect, int error)
 {
-    if (tok < MAX_SYMBOLS) {
-        if (error > 0 && symbol[tok].tok != expect) {
+    if (symidx) {
+        if (error > 0 && get_symbol(symidx)->tok != expect) {
             parse_error(error);
             return 0;
         }
-        return symbol[tok].tok;
+        return get_symbol(symidx)->tok;
     }
     else if (tok != expect) {
         if (error > 0)
@@ -467,11 +489,11 @@ static int ICACHE_FLASH_ATTR check_token(int tok, int expect, int error)
 static int ICACHE_FLASH_ATTR parse_check_unary(int c, int last)
 {
     if (c == MINUS || c == PLUS) {
-        if (check_token(last, NUMBER, 0) == NUMBER
-            || check_token(last, STRING, 0) == STRING
-            || check_token(last, IDENTIFIER, 0) == IDENTIFIER
-            || check_token(last, FUNCTION, 0) == FUNCTION
-            || check_token(last, RPAREN, 0) == RPAREN)
+        if (check_token(last, NULL, NUMBER, 0) == NUMBER
+            || check_token(last, NULL, STRING, 0) == STRING
+            || check_token(last, NULL, IDENTIFIER, 0) == IDENTIFIER
+            || check_token(last, NULL, FUNCTION, 0) == FUNCTION
+            || check_token(last, NULL, RPAREN, 0) == RPAREN)
             return 0;
 
         return UNARY;
@@ -482,7 +504,7 @@ static int ICACHE_FLASH_ATTR parse_check_unary(int c, int last)
     return 0;
 }
 
-static int ICACHE_FLASH_ATTR is_keyword(int tok) { return tok < symbol_count && symbol[tok].tok < NUM_KEYWORDS; }
+static int ICACHE_FLASH_ATTR is_keyword(SYMIDX symidx) { return symidx != NULL && get_symbol(symidx)->tok < NUM_KEYWORDS; }
 static int ICACHE_FLASH_ATTR is_relop(int tok) { return tok == LT || tok == GT || tok == EQ || tok == NEQ || tok == GE || tok == LE; }
 static int ICACHE_FLASH_ATTR is_logop(int tok) { return tok == AND || tok == OR || tok == NOT; }
 
@@ -580,22 +602,23 @@ static void ICACHE_FLASH_ATTR reduce(int *arg_stack, int *operator_stack)
 
 static int ICACHE_FLASH_ATTR expr(struct urubasic_type *tval);
 
-static int ICACHE_FLASH_ATTR function_call(int symidx, int paren_optional, struct urubasic_type *retval)
+static int ICACHE_FLASH_ATTR function_call(SYMIDX symidx, int paren_optional, struct urubasic_type *retval)
 {
-    int tok, i, n = 1, val, to_be_pushed = 0, dummy;
+    int tok, i, n = 1, val, to_be_pushed = 0;
+    SYMIDX dummy;
     int endtok = RPAREN;
     struct urubasic_type tval = { 0, }, arg[MAX_FUNCTION_ARGS+1];
 
     tok = lex_next_token(&dummy);
-    if (LPAREN != check_token(tok, LPAREN, 0) && paren_optional)
+    if (LPAREN != check_token(tok, NULL, LPAREN, 0) && paren_optional)
         endtok = NEWLINE;
 
     arg[0].type = arg[0].value = 0;  // return value
 
-    if (endtok == NEWLINE || LPAREN == check_token(tok, LPAREN, 0)) {
+    if (endtok == NEWLINE || LPAREN == check_token(tok, NULL, LPAREN, 0)) {
         if (endtok != NEWLINE)
             tok = lex_next_token(&dummy);
-        while (endtok != check_token(tok, endtok, 0)) {
+        while (endtok != check_token(tok, NULL, endtok, 0)) {
             lex_push_token(tok);
             if (tok == COLON)
                 break;
@@ -603,38 +626,38 @@ static int ICACHE_FLASH_ATTR function_call(int symidx, int paren_optional, struc
             if (n < MAX_FUNCTION_ARGS)
                 arg[n++] = tval;
             tok = lex_next_token(&dummy);
-            if (COMMA == check_token(tok, COMMA, 0))
+            if (COMMA == check_token(tok, NULL, COMMA, 0))
                 tok = lex_next_token(&dummy);
         }
     }
     else
         to_be_pushed = tok;
 
-    if (symbol[symidx].func == NULL) {
+    if (get_symbol(symidx)->func == NULL) {
         // user supplied function
         char *old_input_buffer = lex_input_buffer, var[MAX_LINE_LEN];
-        int old_symbol_count = extra_count;
+        SYMIDX old_extra = extra_table;
 
         // setup up lexer to read the DEF statement
         lex_clear();
         pushed_token_stack[0] = 0;
-        if (symbol[symidx].value_ptr == NULL)
+        if (get_symbol(symidx)->value_ptr == NULL)
             parse_error(E_SYNTAX_ERROR);
         else
-            lex_input_buffer = &program[insn_info[*symbol[symidx].value_ptr].offset];
+            lex_input_buffer = insn_info[*get_symbol(symidx)->value_ptr].line;
         tok = lex_next_token(&dummy);
-        check_token(tok, DEF, E_MISSING_DEF);
+        check_token(tok, dummy, DEF, E_MISSING_DEF);
         tok = lex_next_token(&dummy);
-        check_token(tok, FUNCTION, E_MISSING_IDENTIFIER);
+        check_token(tok, dummy, FUNCTION, E_MISSING_IDENTIFIER);
 
         tok = lex_next_token(&dummy);
-        if (LPAREN == check_token(tok, LPAREN, 0)) {
+        if (LPAREN == check_token(tok, dummy, LPAREN, 0)) {
             tok = lex_next_token(&dummy);
-            while (RPAREN != check_token(tok, RPAREN, 0)) {
-                check_token(tok, IDENTIFIER, E_MISSING_IDENTIFIER);
+            while (RPAREN != check_token(tok, dummy, RPAREN, 0)) {
+                check_token(tok, dummy, IDENTIFIER, E_MISSING_IDENTIFIER);
                 strcpy(var, token_text);
                 tok = lex_next_token(&dummy);
-                if (COMMA == check_token(tok, COMMA, 0))
+                if (COMMA == check_token(tok, dummy, COMMA, 0))
                     tok = lex_next_token(&dummy);
             }
         }
@@ -642,11 +665,11 @@ static int ICACHE_FLASH_ATTR function_call(int symidx, int paren_optional, struc
             lex_push_token(tok);
 
         tok = lex_next_token(&dummy);
-        check_token(tok, EQ, E_MISSING_EQUALSIGN);
+        check_token(tok, NULL, EQ, E_MISSING_EQUALSIGN);
         symidx = parse_add_extra_symbol(var);
-        if (symbol[symidx].value_ptr == NULL)
-            symbol[symidx].value_ptr = smemblk_alloc(symbol_names, sizeof(int));
-        *symbol[symidx].value_ptr = arg[1].value;  // add the actual parameter as a symbol
+        if (get_symbol(symidx)->value_ptr == NULL)
+            get_symbol(symidx)->value_ptr = smemblk_alloc(symbol_names, sizeof(int));
+        *get_symbol(symidx)->value_ptr = arg[1].value;  // add the actual parameter as a symbol
         expr(retval); // evaluate the def statement
         val = retval->value;
 
@@ -654,9 +677,16 @@ static int ICACHE_FLASH_ATTR function_call(int symidx, int paren_optional, struc
         lex_clear();
         pushed_token_stack[0] = 0;
         lex_input_buffer = old_input_buffer;
-        smemblk_free(symbol_names, symbol[symidx].value_ptr);
-        symbol[symidx].value_ptr = NULL;
-        extra_count = old_symbol_count;   // remove actual parameter from symbol table
+        smemblk_free(symbol_names, get_symbol(symidx)->value_ptr);
+        get_symbol(symidx)->value_ptr = NULL;
+
+        // remove actual parameter from symbol table
+        while (extra_table != old_extra) {
+            SYMIDX p = extra_table;;
+            extra_table = p->next;
+            smemblk_free(symbol_names, p);
+        }
+
         if (to_be_pushed)
             lex_push_token(to_be_pushed);
     }
@@ -664,7 +694,7 @@ static int ICACHE_FLASH_ATTR function_call(int symidx, int paren_optional, struc
         // builtin function
         if (to_be_pushed)
             lex_push_token(to_be_pushed);
-        val = symbol[symidx].func(n, arg, (void *) symbol[symidx].value_ptr);
+        val = get_symbol(symidx)->func(n, arg, (void *) get_symbol(symidx)->value_ptr);
 
         for (i=1; i<n; i++) {
             if (arg[i].type == (STRING|ALLOC))
@@ -677,70 +707,72 @@ static int ICACHE_FLASH_ATTR function_call(int symidx, int paren_optional, struc
     return val;
 }
 
-static void ICACHE_FLASH_ATTR lex_next_token_expr(int *tok, int *last, int *paren_depth, int *symidx)
+static void ICACHE_FLASH_ATTR lex_next_token_expr(int *tok, int *last, int *paren_depth, SYMIDX *symidx)
 {
     if (last) *last = *tok;
     *tok = lex_next_token(symidx);
-    if (*tok < MAX_SYMBOLS && (is_logop(symbol[*tok].tok)))
-        *tok = symbol[*tok].tok;
+    if (*tok != 0 && *symidx != NULL && (is_logop(get_symbol(*symidx)->tok)))
+        *tok = get_symbol(*symidx)->tok;
     if (paren_depth) {
         if (*tok == LPAREN) ++*paren_depth;
         if (*tok == RPAREN) --*paren_depth;
     }
 }
 
-static int * ICACHE_FLASH_ATTR parse_subscript(int symidx)
+static int * ICACHE_FLASH_ATTR parse_subscript(SYMIDX symidx)
 {
-    int tok, x = option_base, y = option_base, size = 1, array_base_size = 0, dummy;
+    int tok, x = option_base, y = option_base, size = 1, array_base_size = 0;
+    SYMIDX dummy;
     struct urubasic_type tval = { 0, };
 
     tok = lex_next_token(&dummy);
-    if (LPAREN == check_token(tok, LPAREN, 0)) {
+    if (LPAREN == check_token(tok, dummy, LPAREN, 0)) {
         expr(&tval);
         x = tval.value;
         array_base_size = size = 11 - option_base;
         tok = lex_next_token(&dummy);
-        if (COMMA == check_token(tok, COMMA, 0)) {
+        if (COMMA == check_token(tok, dummy, COMMA, 0)) {
             expr(&tval);
             y = tval.value;
             size *= 11 - option_base;
             tok = lex_next_token(&dummy);
         }
-        check_token(tok, RPAREN, E_MISSING_RPAREN);
+        check_token(tok, dummy, RPAREN, E_MISSING_RPAREN);
     }
     else
         lex_push_token(tok);
 
-    if (symbol[symidx].value_ptr == NULL) {
+    if (get_symbol(symidx)->value_ptr == NULL) {
         if ((y - option_base) + (x - option_base) >= size) {
             parse_error(E_INDEX_OUT_OF_BOUNDS);
             return NULL;
         }
 
-        symbol[symidx].value_ptr = smemblk_zalloc(symbol_names, (int16_t) (size * sizeof(int)));
-        symbol[symidx].array_base_size = array_base_size;
+        get_symbol(symidx)->value_ptr = smemblk_zalloc(symbol_names, (int16_t) (size * sizeof(int)));
+        get_symbol(symidx)->array_base_size = array_base_size;
     }
 
-    return symbol[symidx].value_ptr + symbol[symidx].array_base_size * (y - option_base) + (x - option_base);
+    return get_symbol(symidx)->value_ptr + get_symbol(symidx)->array_base_size * (y - option_base) + (x - option_base);
 }
 
 static int ICACHE_FLASH_ATTR expr(struct urubasic_type *tval)
 {
     int tok, arg_stack[1+2*EXPR_STACK_SIZE], operator_stack[1+EXPR_STACK_SIZE];
-    int last_sym, paren_depth, symidx;
+    int last_sym, paren_depth;
+    SYMIDX symidx;
 
     last_sym = paren_depth = tok = 0;
     arg_stack[0] = 0;           // stack empty
     operator_stack[0] = 0;      // stack_empty
 
 	lex_next_token_expr(&tok, &last_sym, &paren_depth, &symidx);
-    while ((tok != RPAREN || paren_depth >= 0) && tok != NEWLINE && tok != 0 && tok != THEN && tok != COMMA && tok != COLON && tok != SEMICOLON && !is_keyword(tok)) {
-        if (IDENTIFIER == check_token(tok, IDENTIFIER, 0)) {
+    while ((tok != RPAREN || paren_depth >= 0) && tok != NEWLINE && tok != 0 && tok != THEN && tok != COMMA && tok != COLON && tok != SEMICOLON && !(tok < NUM_KEYWORDS || is_keyword(symidx))) {
+        if (IDENTIFIER == check_token(tok, symidx, IDENTIFIER, 0)) {
             int *value_ptr;
             if (symidx == 0)
                 symidx = parse_lookup_symbol(token_text, 1);
-            if (symbol[symidx].value_type == STRING) {
-                char *string = (char *) symbol[symidx].value_ptr;
+            if ((get_symbol(symidx)->value_type & 0xff) == STRING) {
+                char *string = (char *) get_symbol(symidx)->value_ptr;
                 stack_push(arg_stack, string-(char *)symbol_names);
                 stack_push(arg_stack, STRING);
             }
@@ -753,7 +785,7 @@ static int ICACHE_FLASH_ATTR expr(struct urubasic_type *tval)
             }
             lex_next_token_expr(&tok, &last_sym, &paren_depth, &symidx);
         }
-        else if (FUNCTION == check_token(tok, FUNCTION, 0)) {
+        else if (FUNCTION == check_token(tok, symidx, FUNCTION, 0)) {
             struct urubasic_type tval;
             if (symidx == 0)
                 symidx = parse_lookup_symbol(token_text, 1);
@@ -762,12 +794,12 @@ static int ICACHE_FLASH_ATTR expr(struct urubasic_type *tval)
             stack_push(arg_stack, tval.type);
             lex_next_token_expr(&tok, &last_sym, &paren_depth, &symidx);
         }
-        else if (NUMBER == check_token(tok, NUMBER, 0)) {
+        else if (NUMBER == check_token(tok, symidx, NUMBER, 0)) {
             stack_push(arg_stack, token_value);
             stack_push(arg_stack, NUMBER);
             lex_next_token_expr(&tok, &last_sym, &paren_depth, &symidx);
         }
-        else if (STRING == check_token(tok, STRING, 0)) {
+        else if (STRING == check_token(tok, symidx, STRING, 0)) {
             char *string = smemblk_alloc(symbol_names, (int16_t) (strlen(token_text)+1));
             if (string != NULL) {
                 strcpy(string, token_text);
@@ -1022,9 +1054,10 @@ static int ICACHE_FLASH_ATTR func_max(int n, struct urubasic_type *arg, void *us
 
 static int ICACHE_FLASH_ATTR stmt_next(int insn, struct urubasic_type *arg, void *user)
 {
-    int max_val, val, step, symidx, tok;
+    int max_val, val, step, tok;
+    SYMIDX symidx;
     tok = lex_next_token(&symidx);
-    check_token(tok, IDENTIFIER, E_MISSING_IDENTIFIER);
+    check_token(tok, symidx, IDENTIFIER, E_MISSING_IDENTIFIER);
 
     if (symidx == 0)
         symidx = parse_lookup_symbol(token_text, 0);
@@ -1032,9 +1065,9 @@ static int ICACHE_FLASH_ATTR stmt_next(int insn, struct urubasic_type *arg, void
         master_control = 0;
         step           = stack_pop(for_loop_stack);
         max_val        = stack_pop(for_loop_stack);
-        if (symbol[symidx].value_ptr == NULL)
-            symbol[symidx].value_ptr = smemblk_alloc(symbol_names, sizeof(int));
-        *symbol[symidx].value_ptr = val = *symbol[symidx].value_ptr+step;
+        if (get_symbol(symidx)->value_ptr == NULL)
+            get_symbol(symidx)->value_ptr = smemblk_alloc(symbol_names, sizeof(int));
+        *get_symbol(symidx)->value_ptr = val = *get_symbol(symidx)->value_ptr+step;
         if ((step > 0 && val > max_val) || (step < 0 && val < max_val)) {
             // loop finished
             stack_pop(for_loop_stack);
@@ -1065,7 +1098,8 @@ static char * ICACHE_FLASH_ATTR trimright(char *s)
 
 static int ICACHE_FLASH_ATTR stmt_print(int insn, struct urubasic_type *arg, void *user)
 {
-    int tok, ends_with_separator, nargs, dummy;
+    int tok, ends_with_separator, nargs;
+    SYMIDX dummy;
     struct urubasic_type tval = { 0, };
     static char line[MAX_LINE_LEN];
     static int line_len = 0;
@@ -1073,17 +1107,17 @@ static int ICACHE_FLASH_ATTR stmt_print(int insn, struct urubasic_type *arg, voi
     ends_with_separator = nargs = 0;
     while (1) {
         tok = lex_next_token(&dummy);
-        if (TAB == check_token(tok, TAB, 0) || COMMA == check_token(tok, COMMA, 0)) {
+        if (TAB == check_token(tok, dummy, TAB, 0) || COMMA == check_token(tok, dummy, COMMA, 0)) {
             int n;
 
             ++nargs;
-            if (TAB == check_token(tok, TAB, 0)) {
+            if (TAB == check_token(tok, dummy, TAB, 0)) {
                 tok = lex_next_token(&dummy);
-                check_token(tok, LPAREN, E_MISSING_LPAREN);
+                check_token(tok, dummy, LPAREN, E_MISSING_LPAREN);
                 expr(&tval);
                 n = tval.value;
                 tok = lex_next_token(&dummy);
-                check_token(tok, RPAREN, E_MISSING_RPAREN);
+                check_token(tok, dummy, RPAREN, E_MISSING_RPAREN);
                 ends_with_separator = 0;
             }
             else {
@@ -1104,7 +1138,7 @@ static int ICACHE_FLASH_ATTR stmt_print(int insn, struct urubasic_type *arg, voi
                 line_len++;
             }
         }
-        else if (SEMICOLON == check_token(tok, SEMICOLON, 0)) {
+        else if (SEMICOLON == check_token(tok, dummy, SEMICOLON, 0)) {
             ++nargs;
             ends_with_separator = 1;
         }
@@ -1158,13 +1192,20 @@ static int ICACHE_FLASH_ATTR stmt_print(int insn, struct urubasic_type *arg, voi
     return insn+1;
 }
 
+static void ICACHE_FLASH_ATTR set_value_type(SYMIDX symidx, int16_t type)
+{
+    int16_t alloc = get_symbol(symidx)->value_type & (NAME_ALLOC | ALLOC);
+    get_symbol(symidx)->value_type = type | alloc;
+}
+
 static int ICACHE_FLASH_ATTR stmt_read(int insn, struct urubasic_type *arg, void *user)
 {
-    int symidx, tok, *value_ptr;
+    int tok, *value_ptr;
+    SYMIDX symidx;
 
     do {
         tok = lex_next_token(&symidx);
-        check_token(tok, IDENTIFIER, E_MISSING_IDENTIFIER);
+        check_token(tok, symidx, IDENTIFIER, E_MISSING_IDENTIFIER);
         if (symidx == 0)
             symidx = parse_lookup_symbol(token_text, 1);
         value_ptr = parse_subscript(symidx);
@@ -1172,9 +1213,9 @@ static int ICACHE_FLASH_ATTR stmt_read(int insn, struct urubasic_type *arg, void
             if (data_buffer[data_buffer_index] == -1) {
                 char *string;
                 ++data_buffer_index;
-                symbol[symidx].value_type = STRING;
-                string = smemblk_realloc(symbol_names, symbol[symidx].value_ptr, data_buffer[data_buffer_index]);
-                symbol[symidx].value_ptr = (int *) string;
+                set_value_type(symidx, STRING);
+                string = smemblk_realloc(symbol_names, get_symbol(symidx)->value_ptr, data_buffer[data_buffer_index]);
+                get_symbol(symidx)->value_ptr = (int *) string;
                 strcpy(string, &data_buffer[data_buffer_index+1]);
                 data_buffer_index += data_buffer[data_buffer_index]+1;
             }
@@ -1200,7 +1241,7 @@ static int ICACHE_FLASH_ATTR stmt_read(int insn, struct urubasic_type *arg, void
             }
         }
         tok = lex_next_token(&symidx);
-    } while (COMMA == check_token(tok, COMMA, 0));
+    } while (COMMA == check_token(tok, symidx, COMMA, 0));
     return insn+1;
 }
 
@@ -1212,43 +1253,45 @@ static int ICACHE_FLASH_ATTR stmt_restore(int insn, struct urubasic_type *arg, v
 
 static int ICACHE_FLASH_ATTR stmt_def(int insn, struct urubasic_type *arg, void *user)
 {
-    int symidx, tok;
+    int tok;
+    SYMIDX symidx;
 
     tok = lex_next_token(&symidx);
-    check_token(tok, IDENTIFIER, E_MISSING_IDENTIFIER);
+    check_token(tok, symidx, IDENTIFIER, E_MISSING_IDENTIFIER);
     if (symidx == 0)
         symidx = parse_lookup_symbol(token_text, 1);
-    symbol[symidx].tok = FUNCTION;
-    symbol[symidx].func = NULL;
-    if (symbol[symidx].value_ptr == NULL)
-        symbol[symidx].value_ptr = smemblk_alloc(symbol_names, sizeof(int));
-    *symbol[symidx].value_ptr = insn;
+    get_symbol(symidx)->tok = FUNCTION;
+    get_symbol(symidx)->func = NULL;
+    if (get_symbol(symidx)->value_ptr == NULL)
+        get_symbol(symidx)->value_ptr = smemblk_alloc(symbol_names, sizeof(int));
+    *get_symbol(symidx)->value_ptr = insn;
 
     return insn+1;
 }
 
 static int ICACHE_FLASH_ATTR stmt_for(int insn, struct urubasic_type *arg, void *user)
 {
-    int start, end, step = 1, symidx, tok, dummy, i, n;
+    int start, end, step = 1, tok, i, n;
+    SYMIDX dummy, symidx;
     char var[MAX_LINE_LEN];
     struct urubasic_type tval = { 0, };
 
     tok = lex_next_token(&dummy);
-    check_token(tok, IDENTIFIER, E_MISSING_IDENTIFIER);
+    check_token(tok, dummy, IDENTIFIER, E_MISSING_IDENTIFIER);
     strcpy(var, token_text);
 
     tok = lex_next_token(&dummy);
-    check_token(tok, EQ, E_MISSING_EQUALSIGN);
+    check_token(tok, dummy, EQ, E_MISSING_EQUALSIGN);
     expr(&tval);
     start = tval.value;
     symidx = assign(var, start);
     tok = lex_next_token(&dummy);
-    check_token(tok, TO, E_MISSING_TO);
+    check_token(tok, dummy, TO, E_MISSING_TO);
     expr(&tval);
     end = tval.value;
 
     tok = lex_next_token(&dummy);
-    if (STEP == check_token(tok, STEP, 0)) {
+    if (STEP == check_token(tok, dummy, STEP, 0)) {
         expr(&tval);
         step = tval.value;
     }
@@ -1283,17 +1326,18 @@ static int ICACHE_FLASH_ATTR stmt_gosub(int insn, struct urubasic_type *arg, voi
 
 static int ICACHE_FLASH_ATTR stmt_on(int insn, struct urubasic_type *arg, void *user)
 {
-    int val, val_expr, n = 1, tok, new_insn = -1, gosub = 0, dummy;
+    int val, val_expr, n = 1, tok, new_insn = -1, gosub = 0;
+    SYMIDX dummy;
     struct urubasic_type tval = { 0, };
 
     expr(&tval);
     val_expr = tval.value;
 
     tok = lex_next_token(&dummy);
-    if (GOSUB == check_token(tok, GOSUB, 0))
+    if (GOSUB == check_token(tok, dummy, GOSUB, 0))
         gosub = 1;
     else
-        check_token(tok, GOTO, E_MISSING_GOTO);
+        check_token(tok, dummy, GOTO, E_MISSING_GOTO);
     while (new_insn == -1) {
         expr(&tval);
         val = tval.value;
@@ -1301,7 +1345,7 @@ static int ICACHE_FLASH_ATTR stmt_on(int insn, struct urubasic_type *arg, void *
         if (n != val_expr) {
             tok = lex_next_token(&dummy);
             ++n;
-            if (!check_token(tok, COMMA, 0)) {
+            if (!check_token(tok, dummy, COMMA, 0)) {
                 lex_push_token(tok);
                 new_insn = insn+1;
             }
@@ -1337,27 +1381,28 @@ static int ICACHE_FLASH_ATTR stmt_return(int insn, struct urubasic_type *arg, vo
 
 static int ICACHE_FLASH_ATTR stmt_let(int insn, struct urubasic_type *arg, void *user)
 {
-    int symidx, tok, *value_ptr, dummy;
+    int tok, *value_ptr;
+    SYMIDX symidx, dummy;
     struct urubasic_type tval = { 0, };
 
     tok = lex_next_token(&symidx);
-    check_token(tok, IDENTIFIER, E_MISSING_IDENTIFIER);
+    check_token(tok, symidx, IDENTIFIER, E_MISSING_IDENTIFIER);
     if (symidx == 0)
         symidx = parse_lookup_symbol(token_text, 1);
     value_ptr = parse_subscript(symidx);
     tok = lex_next_token(&dummy);
-    check_token(tok, EQ, E_MISSING_EQUALSIGN);
+    check_token(tok, dummy, EQ, E_MISSING_EQUALSIGN);
     if (value_ptr != NULL) {
         expr(&tval);
         if ((tval.type & 0xff) == STRING) {
-            if (symbol[symidx].array_base_size != 0)
+            if (get_symbol(symidx)->array_base_size != 0)
                 parse_error(E_WRONG_TYPE);
-            symbol[symidx].value_type = STRING;
-            smemblk_free(symbol_names, symbol[symidx].value_ptr);
-            symbol[symidx].value_ptr = (int *) ((char *) symbol_names + tval.value);
+            set_value_type(symidx, STRING);
+            smemblk_free(symbol_names, get_symbol(symidx)->value_ptr);
+            get_symbol(symidx)->value_ptr = (int *) ((char *) symbol_names + tval.value);
         }
         else {
-            symbol[symidx].value_type = NUMBER;
+            set_value_type(symidx, NUMBER);
             *value_ptr = tval.value;
         }
     }
@@ -1366,12 +1411,13 @@ static int ICACHE_FLASH_ATTR stmt_let(int insn, struct urubasic_type *arg, void 
 
 static int ICACHE_FLASH_ATTR stmt_if(int insn, struct urubasic_type *arg, void *user)
 {
-    int tok, dummy;
+    int tok;
+    SYMIDX dummy;
     struct urubasic_type tval;
 
     expr(&tval);
     tok = lex_next_token(&dummy);
-    check_token(tok, THEN, E_MISSING_THEN);
+    check_token(tok, dummy, THEN, E_MISSING_THEN);
     if (tval.value) {
         // then
         insn = stmt(insn);
@@ -1388,11 +1434,12 @@ static int ICACHE_FLASH_ATTR stmt_if(int insn, struct urubasic_type *arg, void *
 
 static int ICACHE_FLASH_ATTR stmt_option(int insn, struct urubasic_type *arg, void *user)
 {
-    int tok, v, dummy;
+    int tok, v;
+    SYMIDX dummy;
     struct urubasic_type tval = { 0, };
 
     tok = lex_next_token(&dummy);
-    check_token(tok, BASE, E_MISSING_BASE);
+    check_token(tok, dummy, BASE, E_MISSING_BASE);
     expr(&tval);
     v = tval.value;
     if (v == 0 || v == 1)
@@ -1404,7 +1451,8 @@ static int ICACHE_FLASH_ATTR stmt_option(int insn, struct urubasic_type *arg, vo
 
 static int ICACHE_FLASH_ATTR stmt_dim(int insn, struct urubasic_type *arg, void *user)
 {
-    int tok, x, y, symidx, size, dummy, y_set;
+    int tok, x, y, size, y_set;
+    SYMIDX symidx, dummy;
     struct urubasic_type tval = { 0, };
 
     do {
@@ -1412,32 +1460,32 @@ static int ICACHE_FLASH_ATTR stmt_dim(int insn, struct urubasic_type *arg, void 
         y = option_base;
         y_set = 0;
         tok = lex_next_token(&symidx);
-        check_token(tok, IDENTIFIER, E_MISSING_IDENTIFIER);
+        check_token(tok, symidx, IDENTIFIER, E_MISSING_IDENTIFIER);
         if (symidx == 0)
             symidx = parse_lookup_symbol(token_text, 1);
 
         tok = lex_next_token(&dummy);
-        if (LPAREN == check_token(tok, LPAREN, 0)) {
+        if (LPAREN == check_token(tok, dummy, LPAREN, 0)) {
             expr(&tval);
             x = tval.value;
             tok = lex_next_token(&dummy);
-            if (COMMA == check_token(tok, COMMA, 0)) {
+            if (COMMA == check_token(tok, dummy, COMMA, 0)) {
                 expr(&tval);
                 y = tval.value;
                 y_set = 1;
                 tok = lex_next_token(&dummy);
             }
-            check_token(tok, RPAREN, E_MISSING_RPAREN);
+            check_token(tok, dummy, RPAREN, E_MISSING_RPAREN);
         }
 
         if (x < option_base || (y_set && y < option_base))
             parse_error(E_INVALID_DIM);
 
-        symbol[symidx].array_base_size = x - option_base + 1;
-        size = symbol[symidx].array_base_size * (y - option_base + 1) * sizeof(int);
-        symbol[symidx].value_ptr = smemblk_realloc(symbol_names, symbol[symidx].value_ptr, (int16_t) size);
+        get_symbol(symidx)->array_base_size = x - option_base + 1;
+        size = get_symbol(symidx)->array_base_size * (y - option_base + 1) * sizeof(int);
+        get_symbol(symidx)->value_ptr = smemblk_realloc(symbol_names, get_symbol(symidx)->value_ptr, (int16_t) size);
         tok = lex_next_token(&dummy);
-    } while (COMMA == check_token(tok, COMMA, 0));
+    } while (COMMA == check_token(tok, dummy, COMMA, 0));
 
     lex_push_token(tok);
     return insn+1;
@@ -1445,14 +1493,15 @@ static int ICACHE_FLASH_ATTR stmt_dim(int insn, struct urubasic_type *arg, void 
 
 static int ICACHE_FLASH_ATTR stmt(int insn)
 {
-    int tok, symidx;
+    int tok;
+    SYMIDX symidx;
 
     tok = lex_next_token(&symidx);
     if (tok == 0)
         return -1;
 
-    if (is_keyword(tok) && symbol[tok].tok == NEXT)
-        insn = symbol[tok].func(insn, NULL, (void *) symbol[tok].value_ptr);
+    if (is_keyword(symidx) && get_symbol(symidx)->tok == NEXT)
+        insn = get_symbol(symidx)->func(insn, NULL, (void *) get_symbol(symidx)->value_ptr);
     else if (master_control) {
         ++insn;
     }
@@ -1462,13 +1511,13 @@ static int ICACHE_FLASH_ATTR stmt(int insn)
         expr(&tval);
         insn = find_insn(tval.value);
     }
-    else if (is_keyword(tok))
-        insn = symbol[tok].func(insn, NULL, (void *) symbol[tok].value_ptr);
-    else if (IDENTIFIER == check_token(tok, IDENTIFIER, 0)) {
+    else if (is_keyword(symidx))
+        insn = get_symbol(symidx)->func(insn, NULL, (void *) get_symbol(symidx)->value_ptr);
+    else if (IDENTIFIER == check_token(tok, symidx, IDENTIFIER, 0)) {
         lex_push_token(tok);
         insn = stmt_let(insn, NULL, NULL);
     }
-    else if (FUNCTION == check_token(tok, FUNCTION, 0)) {
+    else if (FUNCTION == check_token(tok, symidx, FUNCTION, 0)) {
         struct urubasic_type tval;
         if (symidx == 0)
             symidx = parse_lookup_symbol(token_text, 1);
@@ -1491,70 +1540,67 @@ void ICACHE_FLASH_ATTR urubasic_execute(int insn)
     while (insn >= 0 && insn < insn_count) {
         lex_clear();
         pushed_token_stack[0] = 0;
-        lex_input_buffer = &program[insn_info[insn].offset];
-        //current_offset = 0;
+        lex_input_buffer = insn_info[insn].line;
         current_line = insn_info[insn].label;
         insn = stmt(insn);
     }
 }
 
+static void ICACHE_FLASH_ATTR increase_data_buffer(int bytes)
+{
+    if (data_buffer == NULL || data_buffer_index + bytes > data_buffer_max)
+        data_buffer = smemblk_realloc(symbol_names, data_buffer, data_buffer_max += (bytes > 128 ? bytes : 128));
+}
+
 static void ICACHE_FLASH_ATTR read_data(int max_data_buffer)
 {
-    int tok, dummy;
+    int tok;
+    SYMIDX dummy;
     struct urubasic_type tval = { 0, };
 
     do {
-        if (data_buffer_index < max_data_buffer) {
-            tok = lex_next_token(&dummy);
-            if (tok == IDENTIFIER || (tok & 0xff) == STRING) {
-                int len = 1+strlen(token_text);
-                data_buffer[data_buffer_index++] = -1; // string indicator
-                strcpy(&data_buffer[data_buffer_index+1], token_text);
-                data_buffer[data_buffer_index] = len;
-                data_buffer_index += 1+len;
+        tok = lex_next_token(&dummy);
+        if (tok == IDENTIFIER || (tok & 0xff) == STRING) {
+            int len = 1+strlen(token_text);
+            increase_data_buffer(1+len);
+            data_buffer[data_buffer_index++] = -1; // string indicator
+            strcpy(&data_buffer[data_buffer_index+1], token_text);
+            data_buffer[data_buffer_index] = len;
+            data_buffer_index += 1+len;
+        }
+        else if (tok == NUMBER || tok == MINUS) {
+            lex_push_token(tok);
+            expr(&tval);
+            if (tval.value >= -128 && tval.value < 0xff) {
+                increase_data_buffer(2);
+                data_buffer[data_buffer_index] = 1;
+                data_buffer[data_buffer_index+1] = tval.value;
+                data_buffer_index += 2;
             }
-            else if (tok == NUMBER || tok == MINUS) {
-                lex_push_token(tok);
-                expr(&tval);
-                if (tval.value >= -128 && tval.value < 0xff) {
-                    data_buffer[data_buffer_index] = 1;
-                    data_buffer[data_buffer_index+1] = tval.value;
-                    data_buffer_index += 2;
-                }
-                else if (tval.value >= -32768 && tval.value < 0xffff) {
-                    data_buffer[data_buffer_index] = 2;
-                    data_buffer[data_buffer_index+1] = (tval.value >> 8) & 0xff;
-                    data_buffer[data_buffer_index+2] = tval.value & 0xff;
-                    data_buffer_index += 3;
-                }
-                else {
-                    data_buffer[data_buffer_index] = 4;
-                    data_buffer[data_buffer_index+1] = (tval.value >> 24) & 0xff;
-                    data_buffer[data_buffer_index+2] = (tval.value >> 16) & 0xff;
-                    data_buffer[data_buffer_index+3] = (tval.value >> 8) & 0xff;
-                    data_buffer[data_buffer_index+4] = tval.value & 0xff;
-                    data_buffer_index += 5;
-                }
+            else if (tval.value >= -32768 && tval.value < 0xffff) {
+                increase_data_buffer(3);
+                data_buffer[data_buffer_index] = 2;
+                data_buffer[data_buffer_index+1] = (tval.value >> 8) & 0xff;
+                data_buffer[data_buffer_index+2] = tval.value & 0xff;
+                data_buffer_index += 3;
+            }
+            else {
+                increase_data_buffer(5);
+                data_buffer[data_buffer_index] = 4;
+                data_buffer[data_buffer_index+1] = (tval.value >> 24) & 0xff;
+                data_buffer[data_buffer_index+2] = (tval.value >> 16) & 0xff;
+                data_buffer[data_buffer_index+3] = (tval.value >> 8) & 0xff;
+                data_buffer[data_buffer_index+4] = tval.value & 0xff;
+                data_buffer_index += 5;
             }
         }
         tok = lex_next_token(&dummy);
-    } while (COMMA == check_token(tok, COMMA, 0));
+    } while (COMMA == check_token(tok, dummy, COMMA, 0));
     current_char = '\n';
 }
 
-int ICACHE_FLASH_ATTR urubasic_init(int max_mem, int max_symbols, int (*read_from_stdin)(void*), void *arg)
+static void ICACHE_FLASH_ATTR add_std_symbols(void)
 {
-    int insn, count, inside_remark, inside_string, sep = '\n';
-    char *symbol_name_buffer;
-
-    read_arg = arg;
-
-    program = malloc(max_mem);
-    insn_info = calloc(max_mem, 1);
-    data_buffer = malloc(max_mem);
-    symbol = calloc(max_symbols * sizeof(symbol[0]) + HASHSIZE * sizeof(int16_t) + ('_'-'A'+1) * sizeof(int16_t), 1);
-    hashtab = (int16_t *) &symbol[max_symbols];
-
     add_symbol_intern("", 0, NULL, NULL);
     add_symbol_intern("NEXT", NEXT, stmt_next, NULL);
     add_symbol_intern("PRINT", PRINT, stmt_print, NULL);
@@ -1594,10 +1640,23 @@ int ICACHE_FLASH_ATTR urubasic_init(int max_mem, int max_symbols, int (*read_fro
     add_symbol_intern("NOT", NOT, NULL, NULL);
     add_symbol_intern("OR", OR, NULL, NULL);
     add_symbol_intern("STRING$", FUNCTION, func_stringS, NULL);
+}
+
+int ICACHE_FLASH_ATTR urubasic_init(void *mem, int max_mem, int (*read_from_stdin)(void *), void *arg)
+{
+    int insn, count, inside_remark, inside_string, sep = '\n', prev_char, offs;
+
+    read_arg = arg;
+    lex_readchar = read_from_stdin;
+
+    symbol_names = smemblk_init(mem, max_mem);
+    hashtab = smemblk_zalloc(symbol_names, HASHSIZE * sizeof(SYMIDX) + ('_'-'A'+1) * sizeof(SYMIDX));
+    add_std_symbols();
 
     lex_readchar = read_from_stdin;
     do {
 again:  do {
+            prev_char = current_char;
             current_char = lex_readchar(read_arg);
         } while (current_char == '\r' || current_char == '\n' || is_blank(current_char));
 
@@ -1607,82 +1666,94 @@ again:  do {
             goto again;
         }
         insn = insn_count++;
-        insn_info[insn].offset = program_size;
-        insn_info[insn].sep    = sep;
+        if (insn_info == NULL || insn_count > insn_max)
+            insn_info = smemblk_realloc(symbol_names, insn_info, (int16_t) ((insn_max += 32) * sizeof(struct Insn_info)));
+
+        offs = 0;
+        insn_info[insn].line = smemblk_alloc(symbol_names, MAX_LINE_LEN);
+        insn_info[insn].sep  = sep;
         if (is_digit(current_char))
             insn_info[insn].label  = read_number(10);
         else if (insn > 0)
             insn_info[insn].label  = insn_info[insn-1].label;
 
-        while (is_blank(current_char))
+        while (is_blank(current_char)) {
+            prev_char = current_char;
             current_char = lex_readchar(read_arg);
+        }
 
         count = inside_remark = inside_string = 0;
         do {
             if (!inside_remark) {
-                // only copy to program if it's not a comment and not double blank outside string
-                if (program_size < 1 || inside_string || !(is_blank(program[program_size-1]) && is_blank(current_char)))
-                    program[program_size++] = (char) current_char;
+                // only copy to line if it's not a comment and not double blank outside string
+                if (inside_string || !(is_blank(prev_char) && is_blank(current_char)))
+                    insn_info[insn].line[offs++] = (char) current_char;
             }
+            prev_char = current_char;
             current_char = lex_readchar(read_arg);
             inside_string ^= (current_char == '\"');
             ++count;
-            if (count == 4 && 0 == strncmp(&program[insn_info[insn].offset], "REM ", count))
+            if (count == 4 && 0 == strncmp(insn_info[insn].line, "REM ", count))
                 inside_remark = 1;
-            else if (count == 5 && 0 == strncmp(&program[insn_info[insn].offset], "DATA ", count)) {
+            else if (count == 5 && 0 == strncmp(insn_info[insn].line, "DATA ", count)) {
                 lex_shift();
                 read_data(max_mem / sizeof(data_buffer[0]));
             }
         } while (current_char != '\0' && current_char != '\r' && current_char != '\n' && (current_char != ':' || inside_string));
 
         sep = current_char == ':' ? ':' : '\n';
-        program[program_size++] = sep;
+        insn_info[insn].line[offs++] = sep;
+        insn_info[insn].line[offs++] = '\0';
+        insn_info[insn].line = smemblk_realloc(symbol_names, insn_info[insn].line, (int16_t) offs);
     } while (current_char);
 
-    while (program_size % 4)
-        ++program_size;
-    memcpy(&program[program_size], insn_info, sizeof(insn_info[0]) * insn_count);
-    free(insn_info);
-    insn_info = (struct Insn_info *) &program[program_size];
-
-    memcpy(&insn_info[insn_count], data_buffer, data_buffer_index * sizeof(data_buffer[0]));
-    free(data_buffer);
-    data_buffer = (char *) &insn_info[insn_count];
-    data_buffer_max = data_buffer_index;
-    symbol_name_buffer = (char *) &data_buffer[data_buffer_max];
-    symbol_names = smemblk_init(symbol_name_buffer, (int16_t) (max_mem - (symbol_name_buffer-(char *)program)));
-
+    // shrink buffers to max used bytes
+    insn_info = smemblk_realloc(symbol_names, insn_info, (int16_t) ((insn_max = insn_count) * sizeof(struct Insn_info)));
+    data_buffer = smemblk_realloc(symbol_names, data_buffer, data_buffer_max = data_buffer_index);
     data_buffer_index = 0;
     lex_readchar = read_from_buffer;
 
-    return symbol_name_buffer-(char *)program;
+    return 1;
 }
 
 void ICACHE_FLASH_ATTR urubasic_term(void)
 {
     // free all variables
-    int symidx  = symbol_count - 1;
-    while (symidx >= 0) {
-        if ((IDENTIFIER == symbol[symidx].tok || FUNCTION == symbol[symidx].tok) && symbol[symidx].value_ptr != NULL) {
-            smemblk_free(symbol_names, symbol[symidx].value_ptr);
+
+    SYMIDX symidx, p;
+    int i;
+
+    for (i=0; i<HASHSIZE; ++i) {
+        symidx = hashtab[i];
+        while (symidx) {
+            p = symidx;
+            symidx = p->next;
+
+            if ((IDENTIFIER == p->tok || FUNCTION == p->tok) && p->value_ptr != NULL)
+                smemblk_free(symbol_names, p->value_ptr);
+
+            if (p->name != NULL && (p->value_type & NAME_ALLOC))
+               smemblk_free(symbol_names, p->name);
+
+            smemblk_free(symbol_names, p);
         }
-        if (symbol[symidx].name != NULL) {
-            int offset = symbol[symidx].name - (char *) symbol_names;
-            if (offset >= 0 && offset < symbol_names->total_size)
-                smemblk_free(symbol_names, symbol[symidx].name);
-        }
-        --symidx;
     }
 
+    // free memory
+    for (i=0; i<insn_count; ++i)
+        smemblk_free(symbol_names, insn_info[i].line);
+
+    smemblk_free(symbol_names, data_buffer);
+    smemblk_free(symbol_names, insn_info);
+    smemblk_free(symbol_names, hashtab);
     smemblk_term(symbol_names); // check for memory leaks
 
     // reset global variables
     token_value = current_char = previous_char = token_len = 0;
     pushed_token_stack[0] = 0;
     insn_info = NULL;
-    insn_count = 0;
-    program_size = 0;
-    symbol_count = current_line = extra_count = 0;
+    insn_count = insn_max = 0;
+    current_line = 0;
     hashtab = NULL;
     for_loop_stack[0] = 0;
     master_control = 0;
@@ -1690,13 +1761,8 @@ void ICACHE_FLASH_ATTR urubasic_term(void)
     lex_readchar = NULL;
     data_buffer = NULL;
     data_buffer_index = data_buffer_max = 0;
-
-    // free memory
     symbol_names = NULL;
-    free(symbol);
-    symbol = NULL;
-    free(program);
-    program = NULL;
+    extra_table = NULL;
 }
 
 // argument (urubasic_type) handling
