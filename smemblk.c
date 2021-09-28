@@ -6,6 +6,7 @@
 #include <string.h>
 #include "stdintw.h"
 #define ICACHE_FLASH_ATTR
+#define TRACE_LOG printf
 #endif
 #include "smemblk.h"
 
@@ -13,12 +14,12 @@
 
 static int16_t ICACHE_FLASH_ATTR abs16(int16_t n) { return n < 0 ? -n : n; }
 
-static int16_t * ICACHE_FLASH_ATTR block_ptr(smemblk_t *smem, int16_t offset)
+static int16_t * ICACHE_FLASH_ATTR block_ptr(smemblk_t *smem, int offset)
 {
     return (int16_t *)((int8_t *)&smem[1]+offset);
 }
 
-static int16_t ICACHE_FLASH_ATTR block_len(smemblk_t *smem, int16_t offset)
+static int16_t ICACHE_FLASH_ATTR block_len(smemblk_t *smem, int offset)
 {
     return abs16(*block_ptr(smem, offset));
 }
@@ -41,7 +42,7 @@ void ICACHE_FLASH_ATTR smemblk_gc(smemblk_t *smem)
 #ifdef SMEMBLK_DEBUG
 static void ICACHE_FLASH_ATTR debug_dump(smemblk_t *smem)
 {
-    int16_t offset, prev_offset = 0, prev_len = 0;
+    int offset, prev_offset = 0, prev_len = 0;
 
     for (offset = 0; offset < smem->total_size; offset += block_len(smem, offset)) {
         if (offset != prev_offset + prev_len)
@@ -58,11 +59,13 @@ static void ICACHE_FLASH_ATTR debug_dump(smemblk_t *smem)
 }
 #endif
 
-smemblk_t * ICACHE_FLASH_ATTR smemblk_init(char *buffer, int16_t buffer_len)
+smemblk_t * ICACHE_FLASH_ATTR smemblk_init(char *buffer, int buffer_len)
 {
     smemblk_t *smem;
+    int16_t   *p;
+    int       remain;
 
-    while (((long)buffer+2) % 4) {
+    while ((long)buffer % 4) {
         ++buffer;
         buffer_len -= 1;
     }
@@ -71,7 +74,26 @@ smemblk_t * ICACHE_FLASH_ATTR smemblk_init(char *buffer, int16_t buffer_len)
     smem->total_size -= sizeof(smemblk_t);
 
     smem->first_free = 0;
-    *((int16_t *) &smem[1]) = -(smem->total_size);
+    smem->start = 0;
+    p = (int16_t *) &smem[1];
+    while (((long)p+2) % 4) {
+        smem->first_free += 2;
+        smem->start += 2;
+        smem->total_size -= 2;
+        ++p;
+    }
+
+    remain = smem->total_size;
+
+    while (remain > 0) {
+        // if (((long) &p[1]) % 4 != 0)
+        //     TRACE_LOG("ALIGNMENT ERROR\n");
+        *p = remain > 0x7ffc ? -0x7ffc : -remain;
+
+        remain += *p;
+        p += -*p >> 1;
+    }
+
 #ifdef SMEMBLK_DEBUG
     debug_dump(smem);
 #endif
@@ -99,7 +121,7 @@ static void * ICACHE_FLASH_ATTR smemblk_alloc_intern(smemblk_t *smem, int16_t si
 {
     int16_t offset, *p;
 
-    while (size % 4 != 2) // make sure that p+2 is dividable by 0
+    while (size % 4 != 2) // make sure that p+2 is dividable by 4
         ++size;
 
     for (offset = smem->first_free; offset >= 0 && offset < smem->total_size; offset += block_len(smem, offset)) {
@@ -112,7 +134,7 @@ static void * ICACHE_FLASH_ATTR smemblk_alloc_intern(smemblk_t *smem, int16_t si
             }
             mark_as_allocated(smem, p);
             // if (((long) &p[1]) % 4 != 0)
-            //     printf("ALIGNMENT ERROR\n");
+            //     TRACE_LOG("ALIGNMENT ERROR\n");
             return &p[1];
         }
     }
@@ -156,6 +178,7 @@ void * ICACHE_FLASH_ATTR smemblk_realloc(smemblk_t *smem, void *buf, int16_t siz
     p = (int16_t *) buf - 1;
     buf_size = *p - 2;
 
+    // check if next block is needed and allocate if free
     for (next_p=(int8_t *)p+*p; next_p-base_ptr < smem->total_size && *p<size+2; next_p=(int8_t *)p+*p) {
         temp = (int16_t *) next_p;
         if (*temp >= 0)
@@ -166,6 +189,26 @@ void * ICACHE_FLASH_ATTR smemblk_realloc(smemblk_t *smem, void *buf, int16_t siz
     }
 
     if (*p >= size+2) {
+        int16_t remain;
+
+        size   += 2;
+        while (size % 4 != 0) // make sure that p+2 is dividable by 4
+            ++size;
+
+        remain = *p - size;
+        if (remain >= 6) {
+            // shrink the buffer
+            *p = size;
+
+            p = &p[*p >> 1];
+            *p = -remain;
+            // if (((long) &p[1]) % 4 != 0)
+            //     TRACE_LOG("ALIGNMENT ERROR\n");
+
+            if (smem->first_free == -1 || smem->first_free > (p - (int16_t *) &smem[1]) * 2)
+                smem->first_free = (p - (int16_t *) &smem[1]) * 2;
+        }
+
 #ifdef SMEMBLK_DEBUG
         debug_dump(smem);
 #endif
@@ -202,9 +245,9 @@ void ICACHE_FLASH_ATTR smemblk_free(smemblk_t *smem, void *buf)
 void ICACHE_FLASH_ATTR smemblk_term(smemblk_t *smem)
 {
 #ifndef __ETS__
-    int16_t offset, prev_offset = 0, prev_len = 0;
+    int offset, prev_offset = smem->start, prev_len = 0;
 
-    for (offset = 0; offset < smem->total_size; offset += block_len(smem, offset)) {
+    for (offset = smem->start; offset < smem->total_size; offset += block_len(smem, offset)) {
         if (offset != prev_offset + prev_len)
             printf("INTEGRITY ERROR in smemblk offset %d !!\n", offset);
         if (*block_ptr(smem, offset) >= 0)

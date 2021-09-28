@@ -12,6 +12,7 @@
 #include <time.h>
 #include "stdintw.h"
 #define ICACHE_FLASH_ATTR
+#define TRACE_LOG printf
 #endif
 #include <limits.h>
 #include "urubasic.h"
@@ -126,8 +127,10 @@ static int ICACHE_FLASH_ATTR hash(const char *s)
 
 static char * ICACHE_FLASH_ATTR store_string(char *text)
 {
+    char *id;
+
     // store the string in the symbol_name_buffer
-    char *id = smemblk_alloc(symbol_names, (int16_t) (strlen(text) + 1));
+    id = smemblk_alloc(symbol_names, (int16_t) (strlen(text) + 1));
     if (id)
         strcpy(id, text);
     return id;
@@ -160,6 +163,7 @@ static SYMIDX ICACHE_FLASH_ATTR parse_add_symbol(char *name)
     // add a new symbol to the symbol table
     SYMIDX symidx;
     int hval = hash(name);
+
     symidx = new_symbol(name);
     symidx->tok             = IDENTIFIER;
     symidx->value_ptr       = NULL;
@@ -187,6 +191,7 @@ static void ICACHE_FLASH_ATTR add_symbol_intern(char *name, int tok, int (*func)
 void ICACHE_FLASH_ATTR urubasic_add_function(char *name, int (*func)(int n, struct urubasic_type *arg, void *user), void *user)
 {
     SYMIDX symidx;
+
     symidx = parse_add_symbol(store_string(name));
     get_symbol(symidx)->tok             = FUNCTION;
     get_symbol(symidx)->func            = func;
@@ -1368,7 +1373,7 @@ static int ICACHE_FLASH_ATTR stmt_return(int insn, struct urubasic_type *arg, vo
     int step = 0, end = 0;
     do {
         // pop stack until we find a GOSUB (step = 0 and end = -1)
-        if (!stack_empty(for_loop_stack)) step = stack_pop(for_loop_stack);
+        if (!stack_empty(for_loop_stack)) step = stack_pop(for_loop_stack); else return -1;
         if (!stack_empty(for_loop_stack)) end = stack_pop(for_loop_stack);
         if (stack_empty(for_loop_stack))
             insn = -1;
