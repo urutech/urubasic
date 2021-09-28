@@ -20,4 +20,6 @@ void ICACHE_FLASH_ATTR smemblk_free(smemblk_t *smem, void *buf);
 void ICACHE_FLASH_ATTR smemblk_gc(smemblk_t *smem);
 void ICACHE_FLASH_ATTR smemblk_term(smemblk_t *smem);
 
+void ICACHE_FLASH_ATTR smemblk_debug_dump(smemblk_t *smem);
+
 #endif

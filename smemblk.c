@@ -28,7 +28,7 @@ void ICACHE_FLASH_ATTR smemblk_gc(smemblk_t *smem)
 {
     int16_t *p, *base_ptr;
 
-    p = base_ptr = block_ptr(smem, 0);
+    p = base_ptr = block_ptr(smem, smem->start);
     while ((p - base_ptr) < (smem->total_size >> 1) && (((int8_t *) p + abs16(*p)) < (int8_t *) base_ptr + smem->total_size)) {
         if (*p < 0 && p[-*p >> 1] < 0)
             *p += p[-*p >> 1];
@@ -39,25 +39,29 @@ void ICACHE_FLASH_ATTR smemblk_gc(smemblk_t *smem)
     }
 }
 
-#ifdef SMEMBLK_DEBUG
-static void ICACHE_FLASH_ATTR debug_dump(smemblk_t *smem)
+// #ifdef SMEMBLK_DEBUG
+void ICACHE_FLASH_ATTR smemblk_debug_dump(smemblk_t *smem)
 {
-    int offset, prev_offset = 0, prev_len = 0;
+    int offset, prev_offset = smem->start, prev_len = 0, total_used = 0, total_free = 0;
 
-    for (offset = 0; offset < smem->total_size; offset += block_len(smem, offset)) {
+    for (offset = smem->start; offset < smem->total_size; offset += block_len(smem, offset)) {
         if (offset != prev_offset + prev_len)
-            printf("INTEGRITY ERROR in smemblk offset %d !!\n", offset);
-        if (*block_ptr(smem, offset) < 0)
-            printf("%5d: FREE %5d bytes\n", offset, block_len(smem, offset));
-        else
-            printf("%5d: USED %5d bytes\n", offset, block_len(smem, offset));
+            TRACE_LOG("INTEGRITY ERROR in smemblk offset %d !!\n", offset);
+        if (*block_ptr(smem, offset) < 0) {
+            TRACE_LOG("%5d: FREE %5d bytes\n", offset, block_len(smem, offset));
+            total_free += block_len(smem, offset);
+        }
+        else {
+            TRACE_LOG("%5d: USED %5d bytes\n", offset, block_len(smem, offset));
+            total_used += block_len(smem, offset);
+        }
 
         prev_offset = offset;
         prev_len    = block_len(smem, offset);
     }
-    printf("first_free = %d\n\n", (int) (smem->first_free));
+    TRACE_LOG("first_free = %d, total_used = %d, total_free = %d\n\n", (int) (smem->first_free), total_used, total_free);
 }
-#endif
+// #endif
 
 smemblk_t * ICACHE_FLASH_ATTR smemblk_init(char *buffer, int buffer_len)
 {
@@ -249,9 +253,9 @@ void ICACHE_FLASH_ATTR smemblk_term(smemblk_t *smem)
 
     for (offset = smem->start; offset < smem->total_size; offset += block_len(smem, offset)) {
         if (offset != prev_offset + prev_len)
-            printf("INTEGRITY ERROR in smemblk offset %d !!\n", offset);
+            TRACE_LOG("INTEGRITY ERROR in smemblk offset %d !!\n", offset);
         if (*block_ptr(smem, offset) >= 0)
-            printf("%5d: memory leak %5d bytes at %p\n", offset, block_len(smem, offset), block_ptr(smem, offset));
+            TRACE_LOG("%5d: memory leak %5d bytes at %p\n", offset, block_len(smem, offset), block_ptr(smem, offset));
 
         prev_offset = offset;
         prev_len    = block_len(smem, offset);

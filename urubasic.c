@@ -67,6 +67,7 @@ enum ErrorCode {
     E_INVALID_DIM         = 13,
     E_WRONG_TYPE          = 14,
     E_INDEX_OUT_OF_BOUNDS = 15,
+    E_OUT_OF_MEMORY       = 16,
 };
 
 struct symbol_def;
@@ -141,7 +142,8 @@ static SYMIDX ICACHE_FLASH_ATTR new_symbol(char *name)
     SYMIDX symidx;
 
     symidx = smemblk_zalloc(symbol_names, sizeof(*symidx));
-    symidx->name = name;
+    if (symidx)
+        symidx->name = name;
     return symidx;
 }
 
@@ -162,19 +164,28 @@ static SYMIDX ICACHE_FLASH_ATTR parse_add_symbol(char *name)
 {
     // add a new symbol to the symbol table
     SYMIDX symidx;
-    int hval = hash(name);
+    int hval;
+
+    if (name == NULL)
+        return NULL;
+
+    hval = hash(name);
 
     symidx = new_symbol(name);
-    symidx->tok             = IDENTIFIER;
-    symidx->value_ptr       = NULL;
-    symidx->value_type      = NUMBER | NAME_ALLOC;
-    symidx->array_base_size = 0;
-    symidx->next = hashtab[hval];
-    hashtab[hval] = symidx;
-    if (name[1] == '\0' && name[0] >= 'A' && name[0] <= '_')
-        hashtab[HASHSIZE+name[0]-'A'] = hashtab[hval];  // store symidx for quick access, if name is single uppercase letter
+    if (symidx) {
+        symidx->tok             = IDENTIFIER;
+        symidx->value_ptr       = NULL;
+        symidx->value_type      = NUMBER | NAME_ALLOC;
+        symidx->array_base_size = 0;
+        symidx->next = hashtab[hval];
+        hashtab[hval] = symidx;
+        if (name[1] == '\0' && name[0] >= 'A' && name[0] <= '_')
+            hashtab[HASHSIZE+name[0]-'A'] = hashtab[hval];  // store symidx for quick access, if name is single uppercase letter
 
-    return hashtab[hval];
+        return hashtab[hval];
+    }
+    else
+        return NULL;
 }
 
 static void ICACHE_FLASH_ATTR add_symbol_intern(char *name, int tok, int (*func)(int n, struct urubasic_type *arg, void *user), void *user)
@@ -262,6 +273,8 @@ static void ICACHE_FLASH_ATTR parse_error(int error)
         case E_INVALID_DIM:        error_msg("ERROR:%d: invalid dimension specified (%d)\n", current_line, error); break;
         case E_WRONG_TYPE:         error_msg("ERROR:%d: wrong type in assignment (%d)\n", current_line, error); break;
         case E_INDEX_OUT_OF_BOUNDS:error_msg("ERROR:%d: array index is out of bounds (%d)\n", current_line, error); break;
+        case E_OUT_OF_MEMORY:      error_msg("ERROR:%d: out of memory (%d)\n", current_line, error); break;
+
         default:                   error_msg("ERROR:%d: syntax error (%d)\n", current_line, error); break;
     }
 }
@@ -747,7 +760,7 @@ static int * ICACHE_FLASH_ATTR parse_subscript(SYMIDX symidx)
     else
         lex_push_token(tok);
 
-    if (get_symbol(symidx)->value_ptr == NULL) {
+    if (symidx && get_symbol(symidx)->value_ptr == NULL) {
         if ((y - option_base) + (x - option_base) >= size) {
             parse_error(E_INDEX_OUT_OF_BOUNDS);
             return NULL;
@@ -757,7 +770,10 @@ static int * ICACHE_FLASH_ATTR parse_subscript(SYMIDX symidx)
         get_symbol(symidx)->array_base_size = array_base_size;
     }
 
-    return get_symbol(symidx)->value_ptr + get_symbol(symidx)->array_base_size * (y - option_base) + (x - option_base);
+    if (symidx)
+        return get_symbol(symidx)->value_ptr + get_symbol(symidx)->array_base_size * (y - option_base) + (x - option_base);
+    else
+        return NULL;
 }
 
 static int ICACHE_FLASH_ATTR expr(struct urubasic_type *tval)
@@ -776,16 +792,18 @@ static int ICACHE_FLASH_ATTR expr(struct urubasic_type *tval)
             int *value_ptr;
             if (symidx == 0)
                 symidx = parse_lookup_symbol(token_text, 1);
-            if ((get_symbol(symidx)->value_type & 0xff) == STRING) {
-                char *string = (char *) get_symbol(symidx)->value_ptr;
-                stack_push(arg_stack, string-(char *)symbol_names);
-                stack_push(arg_stack, STRING);
-            }
-            else {
-                value_ptr = parse_subscript(symidx);
-                if (value_ptr != NULL) {
-                    stack_push(arg_stack, *value_ptr);
-                    stack_push(arg_stack, NUMBER);
+            if (symidx != NULL) {
+                if ((get_symbol(symidx)->value_type & 0xff) == STRING) {
+                    char *string = (char *) get_symbol(symidx)->value_ptr;
+                    stack_push(arg_stack, string-(char *)symbol_names);
+                    stack_push(arg_stack, STRING);
+                }
+                else {
+                    value_ptr = parse_subscript(symidx);
+                    if (value_ptr != NULL) {
+                        stack_push(arg_stack, *value_ptr);
+                        stack_push(arg_stack, NUMBER);
+                    }
                 }
             }
             lex_next_token_expr(&tok, &last_sym, &paren_depth, &symidx);
@@ -1394,6 +1412,11 @@ static int ICACHE_FLASH_ATTR stmt_let(int insn, struct urubasic_type *arg, void 
     check_token(tok, symidx, IDENTIFIER, E_MISSING_IDENTIFIER);
     if (symidx == 0)
         symidx = parse_lookup_symbol(token_text, 1);
+    if (symidx == NULL) {
+        parse_error(E_OUT_OF_MEMORY);
+        return -1;
+    }
+
     value_ptr = parse_subscript(symidx);
     tok = lex_next_token(&dummy);
     check_token(tok, dummy, EQ, E_MISSING_EQUALSIGN);
@@ -1650,6 +1673,7 @@ static void ICACHE_FLASH_ATTR add_std_symbols(void)
 int ICACHE_FLASH_ATTR urubasic_init(void *mem, int max_mem, int (*read_from_stdin)(void *), void *arg)
 {
     int insn, count, inside_remark, inside_string, sep = '\n', prev_char, offs;
+    char line[MAX_LINE_LEN];
 
     read_arg = arg;
     lex_readchar = read_from_stdin;
@@ -1675,7 +1699,7 @@ again:  do {
             insn_info = smemblk_realloc(symbol_names, insn_info, (int16_t) ((insn_max += 32) * sizeof(struct Insn_info)));
 
         offs = 0;
-        insn_info[insn].line = smemblk_alloc(symbol_names, MAX_LINE_LEN);
+        insn_info[insn].line = line; //smemblk_alloc(symbol_names, MAX_LINE_LEN);
         insn_info[insn].sep  = sep;
         if (is_digit(current_char))
             insn_info[insn].label  = read_number(10);
@@ -1709,7 +1733,8 @@ again:  do {
         sep = current_char == ':' ? ':' : '\n';
         insn_info[insn].line[offs++] = sep;
         insn_info[insn].line[offs++] = '\0';
-        insn_info[insn].line = smemblk_realloc(symbol_names, insn_info[insn].line, (int16_t) offs);
+        insn_info[insn].line = smemblk_alloc(symbol_names, (int16_t) offs);
+        strcpy(insn_info[insn].line, line);
     } while (current_char);
 
     // shrink buffers to max used bytes
